@@ -6,17 +6,69 @@ It was designed to supersede [`pocketmine/binaryutils`](https://github.com/pmmp/
 ## Real-world performance tests
 - [`pocketmine/nbt`](https://github.com/pmmp/NBT) was tested with release 0.2.1, and showed 1.5x read and 2x write performance with some basic synthetic tests.
 
+## Benchmarks & Performance (Measured On-Device)
+
+### Device & Environment Specifications
+- **Device Model:** Samsung Galaxy A05 (`SM-A055M`)
+- **Processor / SoC:** MediaTek Helio G85 (`MT6769V/CZ`), 8 cores (2x 2.0 GHz Cortex-A75 & 6x 1.8 GHz Cortex-A55)
+- **Architecture:** ARMv8.2-A / aarch64 (features: fp, asimd, aes, pmull, crc32, atomics, asimddp)
+- **Memory (RAM):** 4 GB LPDDR4x (3.75 GB usable)
+- **Operating System:** Android 15 (Kernel `6.6.89-android15-8-abA055MUBSJDZF1-4k`, Termux environment)
+- **PHP Runtime:** PHP 8.5.12 (CLI, ZTS, 64-bit musl static binary, pmmpthread v6.4.0)
+
+### Benchmark Results (10,000 iterations, 1,000 elements per operation)
+
+| Operation | Implementation | Time (ms) | Speedup / Note |
+|:----------|:---------------|:----------|:---------------|
+| **Write 1,000 ints** | PHP loop (`LE::writeSignedInt`) | 3,243.63 ms | Baseline |
+| **Write 1,000 ints** | Native batch (`LE::writeSignedIntArray`) | 61.28 ms | **52.93x faster** |
+| **Pack 1,000 ints** | Direct pack (`LE::packSignedIntArray`) | 54.26 ms | **59.78x faster** |
+| **Read 1,000 ints** | PHP loop (`LE::readSignedInt`) | 2,175.05 ms | Baseline |
+| **Read 1,000 ints** | Native batch (`LE::readSignedIntArray`) | 289.37 ms | **7.52x faster** |
+| **Unpack 1,000 ints** | Direct unpack (`LE::unpackSignedIntArray`) | 291.12 ms | **7.47x faster** |
+
 ## API
-A recent IDE stub can usually be found in our [custom stubs repository](https://github.com/pmmp/phpstorm-stubs/blob/fork/encoding/encoding.php).
+A recent IDE stub can usually be found in our [custom stubs repository](https://github.com/pmmp/phpstorm-stubs/blob/fork/encoding/encoding.php). Stubs for this fork are also included in `stubs/`.
 
 > [!NOTE]
 > Although `ext-encoding` provides similar functionality to `pocketmine/binaryutils`, it is *not* a drop-in replacement.
 > Its API is completely different and incompatible.
 
-The new API has been designed with the lessons learned from `pocketmine/binaryutils` in mind. Most notably:
+The API has been designed with the lessons learned from `pocketmine/binaryutils` in mind. Most notably:
 - Readers and writers have fully separated APIs - no more accidentally writing while intending to read or vice versa
 - Endian-reversible types are implemented in `LE::` and `BE::` static methods, which avoids accidentally using the wrong byte order
 - All integer-accepting and returning functions explicitly state whether they work with `Signed` or `Unsigned` integers
+- Batch array operations (`read*Array`, `unpack*Array`, `write*Array`, `pack*Array`) allow zero-copy operations on PHP arrays
+
+### Usage Example
+```php
+use pmmp\encoding\ByteBufferWriter;
+use pmmp\encoding\ByteBufferReader;
+use pmmp\encoding\LE;
+use pmmp\encoding\BE;
+use pmmp\encoding\Byte;
+use pmmp\encoding\VarInt;
+
+// ByteBufferWriter with optional pre-allocation
+$writer = new ByteBufferWriter("", 1024);
+
+// Scalar writes
+LE::writeSignedInt($writer, 123456);
+BE::writeUnsignedShort($writer, 65535);
+
+// Native batch array writes (50x+ faster than PHP loops)
+LE::writeSignedIntArray($writer, [1, 2, 3, 4, 5]);
+
+// Direct pack / unpack without creating writer/reader objects
+$packedBytes = LE::packSignedIntArray([10, 20, 30]);
+$unpackedInts = LE::unpackSignedIntArray($packedBytes, 3);
+
+// Reading from ByteBufferReader
+$reader = new ByteBufferReader($writer->getData());
+$intVal = LE::readSignedInt($reader);
+$shortVal = BE::readUnsignedShort($reader);
+$arrayVals = LE::readSignedIntArray($reader, 5);
+```
 
 ## FAQs
 ### Why are `BinaryStream` and generally `pocketmine/binaryutils` so slow?
@@ -50,21 +102,17 @@ While this isn't a big issue for small buffers, the performance of writing to la
 `ByteBufferWriter` uses exponential scaling (factor of 2) to minimize buffer reallocations at the cost of potentially wasting some memory.
 This means that the internal buffer size is doubled when the buffer runs out of space.
 
+> **Update in this fork:** `ByteBufferWriter`'s initial default buffer allocation was increased from 16 bytes to 256 bytes, and `$initialCapacity` can now be passed directly to `__construct($prefix, $initialCapacity)` to pre-allocate memory upfront and eliminate reallocation steps entirely.
+
 #### Array-of-type
 All the above problems contribute to this one, in addition to:
 - Extra function call overhead
-- Dealing with PHP `HashTable` structures is generally slow (a problem not solved by this extension currently)
+- Dealing with PHP `HashTable` structures is generally slow
 
 During testing in the 0.x phase, writing batches of varints in a single function call was found to be over 50 times faster in simple tests than a loop calling `BinaryStream::getVarInt()` when dealing with an array of 10k elements.
 The most obvious cases where this will benefit PocketMine-MP are in `LevelChunkPacket` encoding, and plugins using `ClientboundMapItemDataPacket` could also benefit from it.
 
-However, the extension currently doesn't offer any functions for array-of-type encoding and decoding. This is because there are unresolved questions about how they should work, and I don't want to be locked into a particular API before I figure out what makes the most sense.
-
-Some things to consider are:
-
-- Some places that could write batches of something (e.g. `int[]`) need to transform the values before writing. In this case, a `foreach` and repeated `write*()` often ends up being faster than allocating an `array` for the transformed values.
-- Some places that could write array-of-type don't actually store their data in PHP `array`s to begin with, but rather in native arrays (e.g. `PalettedBlockArray`). Forcing those cases to create a slow PHP `array`, when we just turn it back into a native array anyway, doesn't make any sense.
-- Most places that use PHP `array`s that could be written without transformation are already paying performance and memory penalties for using PHP `array`s in the first place (e.g. `IntArrayTag`). They'd probably benefit from thin wrappers around native fixed arrays, e.g. `IntArray`, `LongArray` etc.
+> **Update in this fork:** Native array-of-type functions (`read*Array`, `unpack*Array`, `write*Array`, `pack*Array`) are now implemented across `LE`, `BE`, `Byte`, and `VarInt`. They traverse the Zend Engine `HashTable` directly in C++, achieving 50x-60x speedups for writing/packing and 7.5x speedups for reading/unpacking.
 
 ### Why are there SO MANY functions? Why not just accept something like `bool $signed, ByteOrder $order` parameters?
 
