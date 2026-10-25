@@ -11,16 +11,18 @@ extern "C" {
 static zend_object_handlers byte_buffer_writer_zend_object_handlers;
 zend_class_entry* byte_buffer_writer_ce;
 
-static void writer_init_properties(byte_buffer_writer_zend_object* object, unsigned char* buffer, size_t length, size_t offset) {
+static void writer_init_properties(byte_buffer_writer_zend_object* object, unsigned char* buffer, size_t length, size_t offset, size_t initialCapacity = 0) {
 	object->writer.length = length; //we don't need to copy reserved memory
 	object->writer.offset = offset;
 	object->writer.used = length;
 	if (length == 0) {
-		const unsigned int preallocSize = 16;
+		const size_t preallocSize = initialCapacity > 0 ? initialCapacity : 256;
 		object->writer.buffer = reinterpret_cast<unsigned char*>(emalloc(preallocSize));
 		object->writer.length = preallocSize;
 	} else {
-		object->writer.buffer = reinterpret_cast<unsigned char*>(emalloc(length));
+		size_t allocSize = initialCapacity > length ? initialCapacity : length;
+		object->writer.buffer = reinterpret_cast<unsigned char*>(emalloc(allocSize));
+		object->writer.length = allocSize;
 		memcpy(object->writer.buffer, buffer, length);
 	}
 }
@@ -74,11 +76,13 @@ static int writer_compare_objects(zval* obj1, zval* obj2) {
 
 WRITER_METHOD(__construct) {
 	zend_string* buffer = NULL;
+	zend_long capacity = 0;
 	byte_buffer_writer_zend_object* object;
 
-	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 0, 1)
+	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 0, 2)
 		Z_PARAM_OPTIONAL
 		Z_PARAM_STR(buffer)
+		Z_PARAM_LONG(capacity)
 	ZEND_PARSE_PARAMETERS_END();
 
 	object = WRITER_THIS();
@@ -90,8 +94,9 @@ WRITER_METHOD(__construct) {
 		buffer = zend_empty_string;
 	}
 
+	size_t initCap = capacity > 0 ? (size_t)capacity : 0;
 	//write offset is placed at the end, as if the given string was written using writeByteArray()
-	writer_init_properties(object, reinterpret_cast<unsigned char*>(ZSTR_VAL(buffer)), ZSTR_LEN(buffer), ZSTR_LEN(buffer));
+	writer_init_properties(object, reinterpret_cast<unsigned char*>(ZSTR_VAL(buffer)), ZSTR_LEN(buffer), ZSTR_LEN(buffer), initCap);
 }
 
 WRITER_METHOD(getData) {

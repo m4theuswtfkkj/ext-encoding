@@ -30,6 +30,25 @@ extern "C" {
 ARG_INFOS(zend_long, IS_LONG)
 ARG_INFOS(double, IS_DOUBLE)
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_read_array, 0, 2, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, buffer, pmmp\\encoding\\ByteBufferReader, 0)
+	ZEND_ARG_TYPE_INFO(0, count, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_unpack_array, 0, 2, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, bytes, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, count, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_write_array, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, buffer, pmmp\\encoding\\ByteBufferWriter, 0)
+	ZEND_ARG_TYPE_INFO(0, values, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pack_array, 0, 1, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, values, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 #if PHP_VERSION_ID >= 80400
 static const char* read_generic_doc_comment = "/** @throws DataDecodeException */";
 #endif
@@ -196,6 +215,96 @@ void ZEND_FASTCALL zif_packType(INTERNAL_FUNCTION_PARAMETERS) {
 	}
 }
 
+typedef bool (*read_array_func_t)(unsigned char*, size_t, size_t&, size_t, zval*);
+typedef void (*write_array_func_t)(unsigned char*&, size_t&, size_t&, HashTable*);
+
+template<read_array_func_t readFunc>
+void ZEND_FASTCALL zif_readTypeArray(INTERNAL_FUNCTION_PARAMETERS) {
+	zval* object_zv;
+	zend_long count;
+	byte_buffer_reader_zend_object* object;
+
+	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 2, 2)
+		Z_PARAM_OBJECT_OF_CLASS_EX(object_zv, byte_buffer_reader_ce, 0, 0)
+		Z_PARAM_LONG(count)
+	ZEND_PARSE_PARAMETERS_END_EX(return);
+
+	if (count < 0) {
+		zend_value_error("Count must not be negative");
+		return;
+	}
+
+	object = READER_FROM_ZVAL(object_zv);
+	auto bytes = reinterpret_cast<unsigned char*>(ZSTR_VAL(object->reader.buffer));
+	size_t used = ZSTR_LEN(object->reader.buffer);
+
+	readFunc(bytes, used, object->reader.offset, static_cast<size_t>(count), return_value);
+}
+
+template<read_array_func_t readFunc>
+void ZEND_FASTCALL zif_unpackTypeArray(INTERNAL_FUNCTION_PARAMETERS) {
+	zend_string* bytes_str;
+	zend_long count;
+
+	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 2, 2)
+		Z_PARAM_STR(bytes_str)
+		Z_PARAM_LONG(count)
+	ZEND_PARSE_PARAMETERS_END_EX(return);
+
+	if (count < 0) {
+		zend_value_error("Count must not be negative");
+		return;
+	}
+
+	size_t offset = 0;
+	auto bytes = reinterpret_cast<unsigned char*>(ZSTR_VAL(bytes_str));
+	size_t used = ZSTR_LEN(bytes_str);
+
+	readFunc(bytes, used, offset, static_cast<size_t>(count), return_value);
+}
+
+template<typename TValue, write_array_func_t writeFunc>
+void ZEND_FASTCALL zif_writeTypeArray(INTERNAL_FUNCTION_PARAMETERS) {
+	zval* object_zv;
+	HashTable* values;
+	byte_buffer_writer_zend_object* object;
+
+	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 2, 2)
+		Z_PARAM_OBJECT_OF_CLASS_EX(object_zv, byte_buffer_writer_ce, 0, 0)
+		Z_PARAM_ARRAY_HT(values)
+	ZEND_PARSE_PARAMETERS_END_EX(return);
+
+	object = WRITER_FROM_ZVAL(object_zv);
+	writeFunc(object->writer.buffer, object->writer.length, object->writer.offset, values);
+	if (object->writer.offset > object->writer.used) {
+		object->writer.used = object->writer.offset;
+	}
+}
+
+template<typename TValue, write_array_func_t writeFunc>
+void ZEND_FASTCALL zif_packTypeArray(INTERNAL_FUNCTION_PARAMETERS) {
+	HashTable* values;
+	byte_buffer_writer_t writer = { 0 };
+
+	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 1, 1)
+		Z_PARAM_ARRAY_HT(values)
+	ZEND_PARSE_PARAMETERS_END_EX(return);
+
+	uint32_t count = zend_hash_num_elements(values);
+	size_t initialSize = (size_t)count * sizeof(TValue);
+	if (initialSize < 64) initialSize = 64;
+
+	writer.buffer = reinterpret_cast<unsigned char*>(emalloc(initialSize));
+	writer.length = initialSize;
+	writer.offset = 0;
+	writer.used = 0;
+
+	writeFunc(writer.buffer, writer.length, writer.offset, values);
+
+	RETVAL_STRINGL(reinterpret_cast<char*>(writer.buffer), writer.offset);
+	efree(writer.buffer);
+}
+
 ZEND_NAMED_FUNCTION(pmmp_encoding_private_constructor) {
 	//NOOP
 }
@@ -233,6 +342,31 @@ ZEND_NAMED_FUNCTION(pmmp_encoding_private_constructor) {
 		arginfo_pack_##zend_type \
 	)
 
+#define ARRAY_TYPE_ENTRIES(type_name, native_type, read_func, write_func) \
+	BC_ZEND_RAW_FENTRY_WITH_DOC_COMMENT( \
+		"read" type_name "Array", \
+		(zif_readTypeArray<read_func>), \
+		arginfo_read_array, \
+		read_generic_doc_comment \
+	) \
+	\
+	BC_ZEND_RAW_FENTRY_WITH_DOC_COMMENT( \
+		"unpack" type_name "Array", \
+		(zif_unpackTypeArray<read_func>), \
+		arginfo_unpack_array, \
+		read_generic_doc_comment \
+	) \
+	BC_ZEND_RAW_FENTRY( \
+		"write" type_name "Array", \
+		(zif_writeTypeArray<native_type, write_func>), \
+		arginfo_write_array \
+	) \
+	BC_ZEND_RAW_FENTRY( \
+		"pack" type_name "Array", \
+		(zif_packTypeArray<native_type, write_func>), \
+		arginfo_pack_array \
+	)
+
 #define FIXED_TYPE_ENTRIES(type_name, native_type, zend_type, byte_order) \
 	TYPE_ENTRIES( \
 		type_name, \
@@ -242,8 +376,17 @@ ZEND_NAMED_FUNCTION(pmmp_encoding_private_constructor) {
 		(writeFixedSizeType<native_type, byte_order>) \
 	)
 
+#define FIXED_ARRAY_ENTRIES(type_name, native_type, byte_order) \
+	ARRAY_TYPE_ENTRIES( \
+		type_name, \
+		native_type, \
+		(readFixedSizeTypeArrayToHashTable<native_type, byte_order>), \
+		(writeFixedSizeTypeArrayFromHashTable<native_type, byte_order>) \
+	)
+
 #define FIXED_INT_BASE_ENTRIES(zend_name, native_type, byte_order) \
-	FIXED_TYPE_ENTRIES(zend_name, native_type, zend_long, byte_order)
+	FIXED_TYPE_ENTRIES(zend_name, native_type, zend_long, byte_order) \
+	FIXED_ARRAY_ENTRIES(zend_name, native_type, byte_order)
 
 #define FIXED_INT_ENTRIES(zend_name, unsigned_native_type, signed_native_type, byte_order) \
 	FIXED_INT_BASE_ENTRIES("Unsigned" zend_name, unsigned_native_type, byte_order) \
@@ -251,7 +394,8 @@ ZEND_NAMED_FUNCTION(pmmp_encoding_private_constructor) {
 	FIXED_INT_BASE_ENTRIES("Signed" zend_name, signed_native_type, byte_order)
 
 #define FLOAT_ENTRIES(zend_name, native_type, byte_order) \
-	FIXED_TYPE_ENTRIES(zend_name, native_type, double, byte_order)
+	FIXED_TYPE_ENTRIES(zend_name, native_type, double, byte_order) \
+	FIXED_ARRAY_ENTRIES(zend_name, native_type, byte_order)
 
 #define COMPLEX_INT_ENTRIES(zend_name, native_type, read_type, write_type) \
 	TYPE_ENTRIES( \
@@ -265,14 +409,19 @@ ZEND_NAMED_FUNCTION(pmmp_encoding_private_constructor) {
 //triad can't used readFixedSizeType because it's not a power of 2 bytes
 #define TRIAD_ENTRIES(zend_name, unsigned_type, signed_type, byte_order) \
 	COMPLEX_INT_ENTRIES("Unsigned" zend_name, unsigned_type, (readInt24<unsigned_type, byte_order>), (writeInt24<unsigned_type, byte_order>)) \
-	COMPLEX_INT_ENTRIES("Signed" zend_name, signed_type, (readInt24<signed_type, byte_order>), (writeInt24<signed_type, byte_order>))
+	ARRAY_TYPE_ENTRIES("Unsigned" zend_name, unsigned_type, (readInt24ArrayToHashTable<unsigned_type, byte_order>), (writeInt24ArrayFromHashTable<unsigned_type, byte_order>)) \
+	COMPLEX_INT_ENTRIES("Signed" zend_name, signed_type, (readInt24<signed_type, byte_order>), (writeInt24<signed_type, byte_order>)) \
+	ARRAY_TYPE_ENTRIES("Signed" zend_name, signed_type, (readInt24ArrayToHashTable<signed_type, byte_order>), (writeInt24ArrayFromHashTable<signed_type, byte_order>))
 
 #define VARINT_ENTRIES(zend_name, unsigned_type, signed_type) \
 	COMPLEX_INT_ENTRIES("Unsigned" zend_name, unsigned_type, (readUnsignedVarInt<unsigned_type>), (writeUnsignedVarInt<unsigned_type>)) \
-	COMPLEX_INT_ENTRIES("Signed" zend_name, signed_type, (readSignedVarInt<unsigned_type, signed_type>), (writeSignedVarInt<unsigned_type, signed_type>))
+	ARRAY_TYPE_ENTRIES("Unsigned" zend_name, unsigned_type, (readUnsignedVarIntArrayToHashTable<unsigned_type>), (writeUnsignedVarIntArrayFromHashTable<unsigned_type>)) \
+	COMPLEX_INT_ENTRIES("Signed" zend_name, signed_type, (readSignedVarInt<unsigned_type, signed_type>), (writeSignedVarInt<unsigned_type, signed_type>)) \
+	ARRAY_TYPE_ENTRIES("Signed" zend_name, signed_type, (readSignedVarIntArrayToHashTable<unsigned_type, signed_type>), (writeSignedVarIntArrayFromHashTable<unsigned_type, signed_type>))
 
 #define BYTE_ENTRY(zend_name, native_type) \
-	TYPE_ENTRIES(zend_name, native_type, zend_long, (readByte<native_type>), (writeByte<native_type>))
+	TYPE_ENTRIES(zend_name, native_type, zend_long, (readByte<native_type>), (writeByte<native_type>)) \
+	ARRAY_TYPE_ENTRIES(zend_name, native_type, (readByteArrayToHashTable<native_type>), (writeByteArrayFromHashTable<native_type>))
 
 #define ENDIAN_ENTRIES(enum_case) \
 	FIXED_INT_ENTRIES("Short", uint16_t, int16_t, enum_case) \

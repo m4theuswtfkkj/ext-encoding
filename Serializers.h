@@ -2,7 +2,9 @@
 #define SERIALIZERS_H
 
 extern "C" {
+#include "php.h"
 #include "Zend/zend_exceptions.h"
+#include "Zend/zend_API.h"
 }
 #include "classes/DataDecodeException.h"
 #include <algorithm>
@@ -303,6 +305,221 @@ static inline void writeSignedVarInt(unsigned char*& buffer, size_t& length, siz
 	}
 
 	writeUnsignedVarInt<TUnsignedType>(buffer, length, offset, (static_cast<TUnsignedType>(value) << 1) ^ mask);
+}
+
+template<typename TValue>
+static inline TValue extractLong(zval* zv) {
+	if (EXPECTED(Z_TYPE_P(zv) == IS_LONG)) {
+		return static_cast<TValue>(Z_LVAL_P(zv));
+	}
+	return static_cast<TValue>(zval_get_long(zv));
+}
+
+template<typename TValue>
+static inline TValue extractDouble(zval* zv) {
+	if (EXPECTED(Z_TYPE_P(zv) == IS_DOUBLE)) {
+		return static_cast<TValue>(Z_DVAL_P(zv));
+	}
+	return static_cast<TValue>(zval_get_double(zv));
+}
+
+template<typename TValue, ByteOrder byteOrder>
+static inline void writeFixedSizeTypeArrayFromHashTable(unsigned char*& buffer, size_t& length, size_t& offset, HashTable* ht) {
+	uint32_t numElements = zend_hash_num_elements(ht);
+	if (numElements == 0) {
+		return;
+	}
+
+	size_t arraySizeBytes = (size_t)numElements * sizeof(TValue);
+	extendBuffer(buffer, length, offset, arraySizeBytes);
+
+	zval* val;
+	if (byteOrder == ByteOrder::Native) {
+		TValue* dest = reinterpret_cast<TValue*>(&buffer[offset]);
+		ZEND_HASH_FOREACH_VAL(ht, val) {
+			if constexpr (std::is_floating_point<TValue>::value) {
+				*dest++ = extractDouble<TValue>(val);
+			} else {
+				*dest++ = extractLong<TValue>(val);
+			}
+		} ZEND_HASH_FOREACH_END();
+	} else {
+		Flipper<TValue> flipper;
+		size_t currOffset = offset;
+		ZEND_HASH_FOREACH_VAL(ht, val) {
+			if constexpr (std::is_floating_point<TValue>::value) {
+				flipper.value = extractDouble<TValue>(val);
+			} else {
+				flipper.value = extractLong<TValue>(val);
+			}
+			std::reverse(std::begin(flipper.bytes), std::end(flipper.bytes));
+			memcpy(&buffer[currOffset], flipper.bytes, sizeof(flipper.bytes));
+			currOffset += sizeof(TValue);
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	offset += arraySizeBytes;
+}
+
+template<typename TValue, ByteOrder byteOrder>
+static inline bool readFixedSizeTypeArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
+	size_t sizeBytes = count * sizeof(TValue);
+	if (used - offset < sizeBytes) {
+		zend_throw_exception_ex(data_decode_exception_ce, 0, "Need at least %zu bytes, but only have %zu bytes", sizeBytes, used - offset);
+		return false;
+	}
+
+	array_init_size(return_value, (uint32_t)count);
+
+	if (byteOrder == ByteOrder::Native) {
+		TValue* raw = reinterpret_cast<TValue*>(&bytes[offset]);
+		for (size_t i = 0; i < count; i++) {
+			if constexpr (std::is_floating_point<TValue>::value) {
+				add_next_index_double(return_value, static_cast<double>(raw[i]));
+			} else {
+				add_next_index_long(return_value, static_cast<zend_long>(raw[i]));
+			}
+		}
+	} else {
+		Flipper<TValue> flipper;
+		for (size_t i = 0; i < count; i++) {
+			memcpy(flipper.bytes, &bytes[offset + (i * sizeof(TValue))], sizeof(flipper.bytes));
+			std::reverse(std::begin(flipper.bytes), std::end(flipper.bytes));
+			if constexpr (std::is_floating_point<TValue>::value) {
+				add_next_index_double(return_value, static_cast<double>(flipper.value));
+			} else {
+				add_next_index_long(return_value, static_cast<zend_long>(flipper.value));
+			}
+		}
+	}
+
+	offset += sizeBytes;
+	return true;
+}
+
+template<typename TValue>
+static inline void writeByteArrayFromHashTable(unsigned char*& buffer, size_t& length, size_t& offset, HashTable* ht) {
+	uint32_t numElements = zend_hash_num_elements(ht);
+	if (numElements == 0) {
+		return;
+	}
+
+	extendBuffer(buffer, length, offset, (size_t)numElements);
+	zval* val;
+	unsigned char* dest = &buffer[offset];
+	ZEND_HASH_FOREACH_VAL(ht, val) {
+		*dest++ = static_cast<unsigned char>(extractLong<TValue>(val));
+	} ZEND_HASH_FOREACH_END();
+
+	offset += numElements;
+}
+
+template<typename TValue>
+static inline bool readByteArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
+	if (used - offset < count) {
+		zend_throw_exception_ex(data_decode_exception_ce, 0, "Need at least %zu bytes, but only have %zu bytes", count, used - offset);
+		return false;
+	}
+
+	array_init_size(return_value, (uint32_t)count);
+	for (size_t i = 0; i < count; i++) {
+		TValue val = *reinterpret_cast<TValue*>(&bytes[offset + i]);
+		add_next_index_long(return_value, static_cast<zend_long>(val));
+	}
+
+	offset += count;
+	return true;
+}
+
+template<typename TValue, ByteOrder byteOrder>
+static inline void writeInt24ArrayFromHashTable(unsigned char*& buffer, size_t& length, size_t& offset, HashTable* ht) {
+	uint32_t numElements = zend_hash_num_elements(ht);
+	if (numElements == 0) {
+		return;
+	}
+
+	extendBuffer(buffer, length, offset, (size_t)numElements * 3);
+	zval* val;
+	ZEND_HASH_FOREACH_VAL(ht, val) {
+		writeInt24<TValue, byteOrder>(buffer, length, offset, extractLong<TValue>(val));
+	} ZEND_HASH_FOREACH_END();
+}
+
+template<typename TValue, ByteOrder byteOrder>
+static inline bool readInt24ArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
+	if (used - offset < count * 3) {
+		zend_throw_exception_ex(data_decode_exception_ce, 0, "Need at least %zu bytes, but only have %zu bytes", count * 3, used - offset);
+		return false;
+	}
+
+	array_init_size(return_value, (uint32_t)count);
+	for (size_t i = 0; i < count; i++) {
+		TValue result;
+		if (!readInt24<TValue, byteOrder>(bytes, used, offset, result)) {
+			return false;
+		}
+		add_next_index_long(return_value, static_cast<zend_long>(result));
+	}
+
+	return true;
+}
+
+template<typename TValue>
+static inline void writeUnsignedVarIntArrayFromHashTable(unsigned char*& buffer, size_t& length, size_t& offset, HashTable* ht) {
+	uint32_t numElements = zend_hash_num_elements(ht);
+	if (numElements == 0) {
+		return;
+	}
+
+	const auto TYPE_BITS = sizeof(TValue) * CHAR_BIT;
+	extendBuffer(buffer, length, offset, (size_t)numElements * VarIntConstants::MAX_BYTES<TYPE_BITS>);
+
+	zval* val;
+	ZEND_HASH_FOREACH_VAL(ht, val) {
+		writeUnsignedVarInt<TValue>(buffer, length, offset, extractLong<TValue>(val));
+	} ZEND_HASH_FOREACH_END();
+}
+
+template<typename TUnsignedType, typename TSignedType>
+static inline void writeSignedVarIntArrayFromHashTable(unsigned char*& buffer, size_t& length, size_t& offset, HashTable* ht) {
+	uint32_t numElements = zend_hash_num_elements(ht);
+	if (numElements == 0) {
+		return;
+	}
+
+	const auto TYPE_BITS = sizeof(TUnsignedType) * CHAR_BIT;
+	extendBuffer(buffer, length, offset, (size_t)numElements * VarIntConstants::MAX_BYTES<TYPE_BITS>);
+
+	zval* val;
+	ZEND_HASH_FOREACH_VAL(ht, val) {
+		writeSignedVarInt<TUnsignedType, TSignedType>(buffer, length, offset, extractLong<TSignedType>(val));
+	} ZEND_HASH_FOREACH_END();
+}
+
+template<typename TValue>
+static inline bool readUnsignedVarIntArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
+	array_init_size(return_value, (uint32_t)count);
+	for (size_t i = 0; i < count; i++) {
+		TValue result;
+		if (!readUnsignedVarInt<TValue>(bytes, used, offset, result)) {
+			return false;
+		}
+		add_next_index_long(return_value, static_cast<zend_long>(result));
+	}
+	return true;
+}
+
+template<typename TUnsignedType, typename TSignedType>
+static inline bool readSignedVarIntArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
+	array_init_size(return_value, (uint32_t)count);
+	for (size_t i = 0; i < count; i++) {
+		TSignedType result;
+		if (!readSignedVarInt<TUnsignedType, TSignedType>(bytes, used, offset, result)) {
+			return false;
+		}
+		add_next_index_long(return_value, static_cast<zend_long>(result));
+	}
+	return true;
 }
 
 #endif

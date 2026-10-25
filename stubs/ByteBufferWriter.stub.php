@@ -14,8 +14,9 @@ final class ByteBufferWriter{
 	/** @genstubs-expose-comment-block
 	 * Constructs a new ByteBufferWriter.
      * The provided string will be written at the start of the buffer as if readByteArray() was called.
+     * An optional initial capacity may be provided to pre-allocate memory and avoid reallocations.
 	 */
-	public function __construct(string $prefix = ""){}
+	public function __construct(string $prefix = "", int $initialCapacity = 0){}
 
 	/** @genstubs-expose-comment-block
 	 * Returns a string containing the written bytes.
