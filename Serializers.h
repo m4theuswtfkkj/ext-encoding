@@ -361,36 +361,43 @@ static inline void writeFixedSizeTypeArrayFromHashTable(unsigned char*& buffer, 
 	offset += arraySizeBytes;
 }
 
+/**
+ * Initializes a packed array with room for at most `count` elements, never preallocating more than the remaining
+ * input could possibly produce (each element needs at least minBytesPerElement bytes), so a hostile count cannot
+ * force a huge allocation.
+ */
+static inline void initPackedResultArray(zval* return_value, size_t count, size_t availableBytes, size_t minBytesPerElement) {
+	size_t maxElements = availableBytes / minBytesPerElement;
+	array_init_size(return_value, (uint32_t)(count < maxElements ? count : maxElements));
+}
+
 template<typename TValue, ByteOrder byteOrder>
 static inline bool readFixedSizeTypeArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
-	size_t sizeBytes = count * sizeof(TValue);
-	if (used - offset < sizeBytes) {
-		zend_throw_exception_ex(data_decode_exception_ce, 0, "Need at least %zu bytes, but only have %zu bytes", sizeBytes, used - offset);
+	if (count > (used - offset) / sizeof(TValue)) {
+		zend_throw_exception_ex(data_decode_exception_ce, 0, "Need at least %zu bytes, but only have %zu bytes", count * sizeof(TValue), used - offset);
 		return false;
 	}
+	size_t sizeBytes = count * sizeof(TValue);
 
 	array_init_size(return_value, (uint32_t)count);
-
-	if (byteOrder == ByteOrder::Native) {
-		TValue* raw = reinterpret_cast<TValue*>(&bytes[offset]);
-		for (size_t i = 0; i < count; i++) {
-			if constexpr (std::is_floating_point<TValue>::value) {
-				add_next_index_double(return_value, static_cast<double>(raw[i]));
-			} else {
-				add_next_index_long(return_value, static_cast<zend_long>(raw[i]));
+	if (count > 0) {
+		zend_hash_real_init_packed(Z_ARRVAL_P(return_value));
+		const unsigned char* src = &bytes[offset];
+		ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(return_value)) {
+			for (size_t i = 0; i < count; i++) {
+				Flipper<TValue> flipper;
+				memcpy(flipper.bytes, src + (i * sizeof(TValue)), sizeof(flipper.bytes));
+				if (byteOrder != ByteOrder::Native) {
+					std::reverse(std::begin(flipper.bytes), std::end(flipper.bytes));
+				}
+				if constexpr (std::is_floating_point<TValue>::value) {
+					ZEND_HASH_FILL_SET_DOUBLE(static_cast<double>(flipper.value));
+				} else {
+					ZEND_HASH_FILL_SET_LONG(static_cast<zend_long>(flipper.value));
+				}
+				ZEND_HASH_FILL_NEXT();
 			}
-		}
-	} else {
-		Flipper<TValue> flipper;
-		for (size_t i = 0; i < count; i++) {
-			memcpy(flipper.bytes, &bytes[offset + (i * sizeof(TValue))], sizeof(flipper.bytes));
-			std::reverse(std::begin(flipper.bytes), std::end(flipper.bytes));
-			if constexpr (std::is_floating_point<TValue>::value) {
-				add_next_index_double(return_value, static_cast<double>(flipper.value));
-			} else {
-				add_next_index_long(return_value, static_cast<zend_long>(flipper.value));
-			}
-		}
+		} ZEND_HASH_FILL_END();
 	}
 
 	offset += sizeBytes;
@@ -422,9 +429,15 @@ static inline bool readByteArrayToHashTable(unsigned char* bytes, size_t used, s
 	}
 
 	array_init_size(return_value, (uint32_t)count);
-	for (size_t i = 0; i < count; i++) {
-		TValue val = *reinterpret_cast<TValue*>(&bytes[offset + i]);
-		add_next_index_long(return_value, static_cast<zend_long>(val));
+	if (count > 0) {
+		zend_hash_real_init_packed(Z_ARRVAL_P(return_value));
+		const unsigned char* src = &bytes[offset];
+		ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(return_value)) {
+			for (size_t i = 0; i < count; i++) {
+				ZEND_HASH_FILL_SET_LONG(static_cast<zend_long>(static_cast<TValue>(src[i])));
+				ZEND_HASH_FILL_NEXT();
+			}
+		} ZEND_HASH_FILL_END();
 	}
 
 	offset += count;
@@ -447,18 +460,22 @@ static inline void writeInt24ArrayFromHashTable(unsigned char*& buffer, size_t& 
 
 template<typename TValue, ByteOrder byteOrder>
 static inline bool readInt24ArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
-	if (used - offset < count * 3) {
+	if (count > (used - offset) / 3) {
 		zend_throw_exception_ex(data_decode_exception_ce, 0, "Need at least %zu bytes, but only have %zu bytes", count * 3, used - offset);
 		return false;
 	}
 
 	array_init_size(return_value, (uint32_t)count);
-	for (size_t i = 0; i < count; i++) {
-		TValue result;
-		if (!readInt24<TValue, byteOrder>(bytes, used, offset, result)) {
-			return false;
-		}
-		add_next_index_long(return_value, static_cast<zend_long>(result));
+	if (count > 0) {
+		zend_hash_real_init_packed(Z_ARRVAL_P(return_value));
+		ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(return_value)) {
+			for (size_t i = 0; i < count; i++) {
+				TValue result;
+				readInt24<TValue, byteOrder>(bytes, used, offset, result);
+				ZEND_HASH_FILL_SET_LONG(static_cast<zend_long>(result));
+				ZEND_HASH_FILL_NEXT();
+			}
+		} ZEND_HASH_FILL_END();
 	}
 
 	return true;
@@ -498,28 +515,56 @@ static inline void writeSignedVarIntArrayFromHashTable(unsigned char*& buffer, s
 
 template<typename TValue>
 static inline bool readUnsignedVarIntArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
-	array_init_size(return_value, (uint32_t)count);
-	for (size_t i = 0; i < count; i++) {
-		TValue result;
-		if (!readUnsignedVarInt<TValue>(bytes, used, offset, result)) {
-			return false;
-		}
-		add_next_index_long(return_value, static_cast<zend_long>(result));
+	initPackedResultArray(return_value, count, used - offset, 1);
+	if (count == 0) {
+		return true;
 	}
-	return true;
+	//the array was allocated with min(count, remaining bytes) slots; every element consumes at least 1 byte, so it can never overflow
+	zend_hash_real_init_packed(Z_ARRVAL_P(return_value));
+	bool ok = true;
+	ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(return_value)) {
+		for (size_t i = 0; i < count; i++) {
+			TValue result;
+			if (!readUnsignedVarInt<TValue>(bytes, used, offset, result)) {
+				ok = false;
+				break;
+			}
+			ZEND_HASH_FILL_SET_LONG(static_cast<zend_long>(result));
+			ZEND_HASH_FILL_NEXT();
+		}
+	} ZEND_HASH_FILL_END();
+	if (!ok) {
+		zval_ptr_dtor(return_value);
+		ZVAL_NULL(return_value);
+	}
+	return ok;
 }
 
 template<typename TUnsignedType, typename TSignedType>
 static inline bool readSignedVarIntArrayToHashTable(unsigned char* bytes, size_t used, size_t& offset, size_t count, zval* return_value) {
-	array_init_size(return_value, (uint32_t)count);
-	for (size_t i = 0; i < count; i++) {
-		TSignedType result;
-		if (!readSignedVarInt<TUnsignedType, TSignedType>(bytes, used, offset, result)) {
-			return false;
-		}
-		add_next_index_long(return_value, static_cast<zend_long>(result));
+	initPackedResultArray(return_value, count, used - offset, 1);
+	if (count == 0) {
+		return true;
 	}
-	return true;
+	//the array was allocated with min(count, remaining bytes) slots; every element consumes at least 1 byte, so it can never overflow
+	zend_hash_real_init_packed(Z_ARRVAL_P(return_value));
+	bool ok = true;
+	ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(return_value)) {
+		for (size_t i = 0; i < count; i++) {
+			TSignedType result;
+			if (!readSignedVarInt<TUnsignedType, TSignedType>(bytes, used, offset, result)) {
+				ok = false;
+				break;
+			}
+			ZEND_HASH_FILL_SET_LONG(static_cast<zend_long>(result));
+			ZEND_HASH_FILL_NEXT();
+		}
+	} ZEND_HASH_FILL_END();
+	if (!ok) {
+		zval_ptr_dtor(return_value);
+		ZVAL_NULL(return_value);
+	}
+	return ok;
 }
 
 #endif
