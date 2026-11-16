@@ -470,7 +470,7 @@ static inline bool readInt24ArrayToHashTable(unsigned char* bytes, size_t used, 
 		zend_hash_real_init_packed(Z_ARRVAL_P(return_value));
 		ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(return_value)) {
 			for (size_t i = 0; i < count; i++) {
-				TValue result;
+				TValue result = {0};
 				readInt24<TValue, byteOrder>(bytes, used, offset, result);
 				ZEND_HASH_FILL_SET_LONG(static_cast<zend_long>(result));
 				ZEND_HASH_FILL_NEXT();
@@ -524,7 +524,7 @@ static inline bool readUnsignedVarIntArrayToHashTable(unsigned char* bytes, size
 	bool ok = true;
 	ZEND_HASH_FILL_PACKED(Z_ARRVAL_P(return_value)) {
 		for (size_t i = 0; i < count; i++) {
-			TValue result;
+			TValue result = {0};
 			if (!readUnsignedVarInt<TValue>(bytes, used, offset, result)) {
 				ok = false;
 				break;
